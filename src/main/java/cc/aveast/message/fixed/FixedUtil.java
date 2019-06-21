@@ -1,6 +1,7 @@
 package cc.aveast.message.fixed;
 
 import cc.aveast.common.Charset;
+import cc.aveast.common.ErrorCode;
 import cc.aveast.tool.object.ReflectUtil;
 import cc.aveast.tool.string.StringUtil;
 import org.slf4j.Logger;
@@ -11,7 +12,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Field;
-import java.nio.charset.UnsupportedCharsetException;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -258,70 +258,80 @@ public class FixedUtil {
         }
 
         for (Field curField : fields) {
-            // 获取当前成员变量
-            String key;
-            key = curField.getName();
-
             // 设置变量可访问
             curField.setAccessible(true);
 
-                FixedElement fixedElement = curField.getAnnotation(FixedElement.class);
-                if (fixedElement == null && !curField.getType().isAssignableFrom(List.class)) {
-                    // 对于没加FieldLength注解且非List对象的，不处理
-                    continue;
-                }
+            // 获取定长注释
+            FixedElement fixedElement = curField.getAnnotation(FixedElement.class);
+            if (fixedElement == null && !curField.getType().isAssignableFrom(List.class)) {
+                // 对于没加FieldLength注解且非List对象的，不处理
+                continue;
+            }
 
-                String tmp = getValue(curField, object);
-                if (tmp == null) {
-                    tmp = "";
-                }
+            String tmp = getValue(curField, object);
+            if (tmp == null) {
+                tmp = "";
+            }
 
-                if (tmp.trim().length() == 0 && fixedElement.nullreturn()) {
-                    break;
-                }
+            if (tmp.trim().length() == 0 && fixedElement.nullreturn()) {
+               break;
+            }
 
-                int tmpLength = tmp.getBytes().length;
-                if (fixedElement == null || tmpLength == fixedElement.value()) {
+            int tmpLength = tmp.getBytes().length;
+            if (fixedElement == null || tmpLength == fixedElement.value()) {
+                try {
                     byteArrayOutputStream.write(tmp.getBytes());
-                } else if (tmpLength < fixedElement.value()) {
-                    if (fixedElement.number()) {
-                        if (StringUtil.isEmpty(tmp)) {
-                            tmp = "0";
-                        }
+                } catch (IOException e) {
+                    logger.error("序列化成员变量[{}]失败", curField.getName());
+                    return null;
+                }
+            } else if (tmpLength < fixedElement.value()) {
+                if (fixedElement.number()) {
+                    if (StringUtil.isEmpty(tmp)) {
+                        tmp = "0";
+                    }
+                    try {
                         byteArrayOutputStream.write(String.format("%0" + fixedElement.value() + "d", Integer.parseInt(tmp)).getBytes());
-                    } else {
-                        String writeStr = new StringBuffer(tmp)
-                                .append(String.format("%" + (fixedElement.value() - tmpLength) + "s", " "))
-                                .toString();
-
+                    } catch (IOException e) {
+                        logger.error("序列化成员变量[{}]失败", curField.getName());
+                        return null;
+                    }
+                } else {
+                    String writeStr = new StringBuffer(tmp)
+                            .append(String.format("%" + (fixedElement.value() - tmpLength) + "s", " "))
+                            .toString();
+                    try {
                         if (fixedElement.hex()) {
                             byteArrayOutputStream.write(StringUtil.bytes2hex(writeStr.getBytes()).getBytes());
                         } else {
                             byteArrayOutputStream.write(writeStr.getBytes());
                         }
-                    }
-                } else {
-                    byte[] writeByte;
-                    if (fixedElement.hex()) {
-                        writeByte = StringUtil.string2hex(tmp).getBytes();
-                        byteArrayOutputStream.write(writeByte, 0, fixedElement.value() * 2);
-                    } else {
-                        byteArrayOutputStream.write(tmp.getBytes(), 0, fixedElement.value());
+                    } catch (IOException e) {
+                        logger.error("序列化成员变量[{}]失败", curField.getName());
+                        return null;
                     }
                 }
-
+            } else {
+                byte[] writeByte;
+                if (fixedElement.hex()) {
+                    writeByte = StringUtil.string2hex(tmp).getBytes();
+                    byteArrayOutputStream.write(writeByte, 0, fixedElement.value() * 2);
+                } else {
+                    byteArrayOutputStream.write(tmp.getBytes(), 0, fixedElement.value());
+                }
             }
+        }
 
         return byteArrayOutputStream.toByteArray();
     }
 
     /**
-     * 将List型对象转换成定长
+     * 将List型对象序列化
      *
      * @param object list型对象
      * @return 定长报文
      */
-    private static byte[] toByte(List<Object> object) {
+    private static byte[] serialize(List<Object> object) {
         ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
 
         if (object == null || object.size() < 1) {
@@ -329,7 +339,7 @@ public class FixedUtil {
         }
 
         for (Object curObj : object) {
-            byte[] tmp = toByte(curObj.getClass(), curObj);
+            byte[] tmp = serialize(curObj.getClass(), curObj);
             try {
                 byteArrayOutputStream.write(tmp);
             } catch (IOException e) {
@@ -341,85 +351,46 @@ public class FixedUtil {
         return byteArrayOutputStream.toByteArray();
     }
 
+    /**
+     * 向当前成员变量中设置值
+     * @param curField 当前成员变量类型
+     * @param field 待设置值
+     * @param curObject 当前对象
+     * @return
+     */
     private static int setValue(Field curField, byte[] field, Object curObject) {
         Class fieldType;
-        int retCode;
 
         if (field.length == 0) {
             logger.warn("当前字段长度为0，不处理");
             return 0;
         }
 
+        // 获取成员变量类型
         fieldType = curField.getType();
 
         // 基本类型
         if (fieldType.isPrimitive()) {
-            return setPrimitiveValue(fieldType, curField, field, curObject);
+            return ReflectUtil.setPrimitiveValue(fieldType, curField, field, curObject);
         }
 
         // 枚举类
         if (fieldType.isEnum()) {
             logger.error("反转不支持枚举");
-            return -1;
+            return ErrorCode.VARIABLE_TYPE_NOT_SUPPROT.getCode();
         }
 
         if (fieldType.isAssignableFrom(String.class)) {
             // 成员变量 - String类型
-            return setStringValue(curField, field, curObject);
+            return ReflectUtil.setStringValue(curField, field, curObject);
         } else if (Number.class.isAssignableFrom(fieldType)) {
             // 成员变量 - Number类型（基本类型的类）
-            return setPrimitiveValue(fieldType, curField, field, curObject);
+            return ReflectUtil.setPrimitiveValue(fieldType, curField, field, curObject);
         } else {
             logger.error("[{}]类型的成员变量[{}]暂不支持",
                     fieldType.getClass().getSimpleName(), curField.getName());
-            return -1;
+            return ErrorCode.VARIABLE_TYPE_NOT_SUPPROT.getCode();
         }
-    }
-
-    private static int setStringValue(Field curField, byte[] field, Object curObject) {
-        try {
-            curField.set(curObject, new String(field).trim());
-        } catch (IllegalAccessException e) {
-            logger.error("将[{}]类型成员变量[{}]赋值[{}]失败", curField.getType().getSimpleName()
-                    , curField.getName(), new String(field));
-            return -1;
-        }
-
-        return 0;
-    }
-
-    /**
-     * 对基本类成员变量进行赋值
-     *
-     * @param fieldType 成员变量类型
-     * @param curField  成员变量
-     * @param field     字段值
-     * @param curObject 当前类
-     * @return -1 失败
-     */
-    private static int setPrimitiveValue(Class fieldType, Field curField, byte[] field, Object curObject) {
-        String type = fieldType.toString();
-
-        try {
-            if (type.equals("long")) {
-                curField.set(curObject, Long.parseLong(new String(field)));
-            } else if (type.equals("int")) {
-                curField.set(curObject, Integer.parseInt(new String(field)));
-            } else if (type.equals("double")) {
-                curField.set(curObject, Double.parseDouble(new String(field)));
-            } else if (type.equals("float")) {
-                curField.set(curObject, Float.parseFloat(new String(field)));
-            } else if (type.equals("boolean")) {
-                curField.set(curObject, Boolean.parseBoolean(new String(field)));
-            } else {
-                curField.set(curObject, new String(field));
-            }
-        } catch (IllegalAccessException e) {
-            logger.error("将[{}]设置进[{}]类型失败", new String(field), type);
-            return -1;
-        }
-
-        return 0;
     }
 
     private static String getValue(Field field, Object object) {
@@ -449,14 +420,14 @@ public class FixedUtil {
                 return number.toString();
             } else if (type.isAssignableFrom(List.class)) {
                 Object tmp = field.get(object);
-                byte[] tmpByte = toByte((List<Object>) tmp);
+                byte[] tmpByte = serialize((List<Object>) tmp);
                 if (tmpByte == null) {
                     return null;
                 }
                 return new String(tmpByte);
             } else {
                 Object tmp = field.get(object);
-                byte[] tmpByte = toByte(tmp.getClass(), tmp);
+                byte[] tmpByte = serialize(tmp.getClass(), tmp);
                 if (tmpByte == null) {
                     return null;
                 }
